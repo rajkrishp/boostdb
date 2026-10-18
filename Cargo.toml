@@ -1,0 +1,10 @@
+[package]
+name = "boostdb"
+version = "0.1.0"
+edition = "2024"
+description = "A key-value database built from scratch"
+
+[dependencies]
+
+[dev-dependencies]
+tempfile = "3"
