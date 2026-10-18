@@ -139,6 +139,15 @@ impl Wal {
         }
         Ok(result?)
     }
+
+    /// Refuses all further appends, for when the log may no longer be the source of truth.
+    pub fn poison(&mut self) {
+        self.poisoned = true;
+    }
+
+    pub fn is_poisoned(&self) -> bool {
+        self.poisoned
+    }
 }
 
 #[cfg(test)]

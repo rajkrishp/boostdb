@@ -63,8 +63,7 @@ impl MemTable {
             .map(|(k, v)| (k.as_slice(), v.as_deref()))
     }
 
-    /// Bytes of keys and values held; will decide when to flush to an SSTable.
-    #[allow(dead_code)]
+    /// Bytes of keys and values held; decides when to flush to an SSTable.
     pub fn approximate_size(&self) -> usize {
         self.approximate_size
     }

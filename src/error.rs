@@ -10,9 +10,11 @@ pub enum Error {
     Locked,
     KeyTooLarge(usize),
     ValueTooLarge(usize),
-    /// A previous write to the log failed, so its on-disk state is unknown.
-    /// The database refuses further writes until it is reopened.
+    /// A previous write to the log, or a flush of the memtable to an SSTable, failed, so
+    /// the on-disk state is unknown. The database refuses further writes until it is reopened.
     WalPoisoned,
+    /// A file failed its checksum or is malformed.
+    Corruption(String),
 }
 
 impl fmt::Display for Error {
@@ -25,9 +27,10 @@ impl fmt::Display for Error {
             Error::WalPoisoned => {
                 write!(
                     f,
-                    "an earlier log write failed; reopen the database to recover"
+                    "an earlier write to disk failed; reopen the database to recover"
                 )
             }
+            Error::Corruption(what) => write!(f, "corrupt data: {what}"),
         }
     }
 }
