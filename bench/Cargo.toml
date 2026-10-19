@@ -1,0 +1,19 @@
+[package]
+name = "boostdb-bench"
+version = "0.1.0"
+edition = "2024"
+description = "Benchmark harness that produces the same scorecard for every boostdb tutorial part"
+publish = false
+
+# A workspace of its own, not a member of boostdb's: run_all.sh copies this crate into
+# checkouts of older tags, whose Cargo.toml knows nothing about it.
+[workspace]
+
+[features]
+default = ["stats"]
+# Read internal counters through `Db::stats()`, which older parts don't have.
+# run_all.sh builds with `--no-default-features` for those, and the counters come out null.
+stats = []
+
+[dependencies]
+boostdb = { path = ".." }

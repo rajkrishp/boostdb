@@ -1,0 +1,270 @@
+//! `boostdb-bench summary DIR`: a Markdown table comparing every `DIR/*.json`.
+
+use std::fs;
+use std::path::Path;
+
+use crate::fail;
+use crate::json::{self, Value};
+
+#[derive(Clone, Copy)]
+enum Unit {
+    OpsPerSec,
+    Bytes,
+    Micros,
+    Millis,
+    Ratio,
+    Count,
+    Avg,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Better {
+    Higher,
+    Lower,
+}
+
+enum Row {
+    Heading(&'static str),
+    /// JSON field, label, unit, and which direction is an improvement.
+    Metric(&'static str, &'static str, Unit, Better),
+}
+
+use Better::*;
+use Row::*;
+use Unit::*;
+
+/// What the table shows, in order.
+#[rustfmt::skip]
+const ROWS: &[Row] = &[
+    Heading("Writes"),
+    Metric("load_ops_per_sec", "Load throughput, sync off (ops/s)", OpsPerSec, Higher),
+    Metric("sync_write_ops_per_sec", "Write throughput, sync on (ops/s)", OpsPerSec, Higher),
+    Metric("overwrite_ops_per_sec", "Overwrite throughput (ops/s)", OpsPerSec, Higher),
+    Metric("delete_ops_per_sec", "Delete throughput (ops/s)", OpsPerSec, Higher),
+    Metric("write_amp_load", "Write amplification, load", Ratio, Lower),
+    Metric("write_amp_overwrite", "Write amplification, overwrite", Ratio, Lower),
+    Heading("Reads"),
+    Metric("get_hit_p50_us", "Get hit p50", Micros, Lower),
+    Metric("get_hit_p99_us", "Get hit p99", Micros, Lower),
+    Metric("get_miss_p50_us", "Get miss p50", Micros, Lower),
+    Metric("get_miss_p99_us", "Get miss p99", Micros, Lower),
+    Metric("sstables_per_get_hit", "SSTables checked per get hit", Avg, Lower),
+    Metric("sstables_per_get_miss", "SSTables checked per get miss", Avg, Lower),
+    Metric("blocks_per_get_hit", "Blocks read per get hit", Avg, Lower),
+    Metric("blocks_per_get_miss", "Blocks read per get miss", Avg, Lower),
+    Metric("get_hit_after_overwrite_p50_us", "Get hit p50 after overwrite", Micros, Lower),
+    Metric("get_hit_after_overwrite_p99_us", "Get hit p99 after overwrite", Micros, Lower),
+    Metric("sstables_per_get_hit_after_overwrite", "SSTables checked per get hit after overwrite", Avg, Lower),
+    Metric("scan_p50_us", "Scan p50 (~100 keys)", Micros, Lower),
+    Metric("scan_p99_us", "Scan p99 (~100 keys)", Micros, Lower),
+    Metric("blocks_per_scan", "Blocks read per scan", Avg, Lower),
+    Heading("Space and memory"),
+    Metric("peak_rss_load_bytes", "Peak memory, load", Bytes, Lower),
+    Metric("peak_rss_open_bytes", "Peak memory, open", Bytes, Lower),
+    Metric("recovery_ms", "Recovery time (open after load)", Millis, Lower),
+    Metric("disk_bytes_after_load", "Disk after load", Bytes, Lower),
+    Metric("space_amp_after_load", "Space amplification after load", Ratio, Lower),
+    Metric("space_amp_after_overwrite", "Space amplification after overwrite", Ratio, Lower),
+    Metric("space_amp_after_delete", "Space amplification after delete", Ratio, Lower),
+    Metric("files_after_load", "Files after load", Count, Lower),
+    Metric("files_after_overwrite", "Files after overwrite", Count, Lower),
+    Heading("Durability"),
+    Metric("acked_writes_lost", "Acknowledged writes lost after SIGKILL", Count, Lower),
+    Metric("crash_reopen_failures", "Reopen failures after SIGKILL", Count, Lower),
+    Metric("wrong_results", "Wrong read results", Count, Lower),
+];
+
+/// Changes smaller than this fraction are shown as "same", since timings are noisy.
+const NOISE: f64 = 0.05;
+
+pub fn main(args: &[String]) {
+    let [dir] = args else {
+        fail("summary needs one argument, the results directory");
+    };
+    print!("{}", render(&load(Path::new(dir))));
+}
+
+/// Every `*.json` in `dir`: the parts in order (files are named after their tags), then any
+/// other refs by name.
+fn load(dir: &Path) -> Vec<(String, Value)> {
+    let mut paths: Vec<_> = fs::read_dir(dir)
+        .unwrap_or_else(|e| fail(&format!("cannot read {}: {e}", dir.display())))
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.extension().is_some_and(|e| e == "json"))
+        .collect();
+    paths.sort_by_key(|p| {
+        let name = p.file_name().unwrap().to_string_lossy().into_owned();
+        (!name.starts_with("part-"), name)
+    });
+    paths
+        .into_iter()
+        .map(|path| {
+            let text = fs::read_to_string(&path).unwrap();
+            let doc =
+                json::parse(&text).unwrap_or_else(|e| fail(&format!("{}: {e}", path.display())));
+            let name = doc
+                .get("tag")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .unwrap_or_else(|| path.file_stem().unwrap().to_string_lossy().into_owned());
+            (name, doc)
+        })
+        .collect()
+}
+
+fn render(runs: &[(String, Value)]) -> String {
+    let mut out = String::from("# boostdb benchmark summary\n\n");
+    if runs.is_empty() {
+        out.push_str("No results yet. Run `bench/run_all.sh`.\n");
+        return out;
+    }
+    out.push_str(
+        "Generated by `bench/run_all.sh`; each column is one tutorial part. Timings are the \
+         median of several runs and vary by machine; counts (amplification, SSTables and \
+         blocks per operation, files) are exact and reproduce anywhere. In parentheses: the \
+         change from the previous part, ignoring timing changes under 5%. `n/a`: the part \
+         can't report it (counters need `Db::stats()`, added after part 02).\n\n",
+    );
+
+    let config = |doc: &Value, field: &str| {
+        doc.get("config")
+            .and_then(|c| c.get(field))
+            .and_then(Value::as_f64)
+    };
+    let first = &runs[0].1;
+    let keys = config(first, "keys").unwrap_or(0.0);
+    out.push_str(&format!(
+        "Workload: {} keys of {} B with {} B values, {} runs per timed workload, seed {}.\n\n",
+        group_digits(keys),
+        config(first, "key_bytes").unwrap_or(0.0),
+        config(first, "value_bytes").unwrap_or(0.0),
+        config(first, "reps").unwrap_or(0.0),
+        config(first, "seed").unwrap_or(0.0),
+    ));
+
+    out.push_str("| Metric |");
+    for (name, _) in runs {
+        out.push_str(&format!(" {name} |"));
+    }
+    out.push_str("\n|---|");
+    out.push_str(&"---:|".repeat(runs.len()));
+    out.push('\n');
+    for row in ROWS {
+        let (field, label, unit, better) = match row {
+            Heading(label) => {
+                out.push_str(&format!("| **{label}** |{}\n", " |".repeat(runs.len())));
+                continue;
+            }
+            Metric(field, label, unit, better) => (field, label, unit, better),
+        };
+        let arrow = if *better == Higher { "↑" } else { "↓" };
+        out.push_str(&format!("| {label} {arrow} |"));
+        let mut previous = None;
+        for (_, doc) in runs {
+            let value = doc
+                .get("metrics")
+                .and_then(|m| m.get(field))
+                .and_then(Value::as_f64);
+            let mut cell = value.map_or_else(|| "n/a".to_string(), |v| format(v, *unit));
+            if let (Some(old), Some(new)) = (previous, value) {
+                cell.push_str(&format!(" ({})", change(old, new, *unit, *better)));
+            }
+            out.push_str(&format!(" {cell} |"));
+            previous = value;
+        }
+        out.push('\n');
+    }
+    out.push_str("\n↑ higher is better, ↓ lower is better.\n\n## Runs\n\n");
+    out.push_str("| Part | Commit | Description | Keys | Run at | Machine |\n");
+    out.push_str("|---|---|---|---:|---|---|\n");
+    for (name, doc) in runs {
+        let text = |field: &str| doc.get(field).and_then(Value::as_str).unwrap_or("?");
+        let commit = text("commit");
+        let machine = doc.get("machine");
+        let field = |f: &str| machine.and_then(|m| m.get(f));
+        let cpu = field("cpu").and_then(Value::as_str).unwrap_or("?");
+        let cpus = field("logical_cpus").and_then(Value::as_f64).unwrap_or(0.0);
+        let mem = field("memory_bytes").and_then(Value::as_f64).unwrap_or(0.0);
+        let os = field("os").and_then(Value::as_str).unwrap_or("?");
+        let os_version = field("os_version").and_then(Value::as_str).unwrap_or("");
+        let rustc = field("rustc").and_then(Value::as_str).unwrap_or("?");
+        out.push_str(&format!(
+            "| {name} | `{}` | {} | {} | {} | {cpu}, {cpus} CPUs, {:.0} GiB, {os} {os_version}, {rustc} |\n",
+            &commit[..commit.len().min(7)],
+            text("subject").replace('|', "\\|"),
+            group_digits(config(doc, "keys").unwrap_or(0.0)),
+            text("run_at"),
+            mem / (1u64 << 30) as f64,
+        ));
+    }
+    out
+}
+
+fn change(old: f64, new: f64, unit: Unit, better: Better) -> String {
+    let exact = matches!(unit, Count | Avg | Ratio | Bytes);
+    if old == new || (!exact && (new - old).abs() <= NOISE * old.abs()) {
+        return "same".to_string();
+    }
+    let improved = (new > old) == (better == Higher);
+    let word = if improved { "better" } else { "worse" };
+    if old == 0.0 || new == 0.0 {
+        return word.to_string();
+    }
+    let factor = if new > old { new / old } else { old / new };
+    if factor >= 9.95 {
+        format!("{factor:.0}× {word}")
+    } else if factor >= 1.995 {
+        format!("{factor:.1}× {word}")
+    } else {
+        let percent = ((new - old) / old * 100.0).abs();
+        format!("{percent:.0}% {word}")
+    }
+}
+
+fn format(v: f64, unit: Unit) -> String {
+    match unit {
+        OpsPerSec | Count => group_digits(v),
+        Bytes if v >= (1u64 << 30) as f64 => format!("{:.2} GiB", v / (1u64 << 30) as f64),
+        Bytes => format!("{:.1} MiB", v / (1u64 << 20) as f64),
+        Micros if v >= 100.0 => format!("{v:.0} µs"),
+        Micros => format!("{v:.1} µs"),
+        Millis => format!("{v:.0} ms"),
+        Ratio => format!("{v:.2}×"),
+        Avg => format!("{v:.2}"),
+    }
+}
+
+fn group_digits(v: f64) -> String {
+    let digits = format!("{:.0}", v.abs());
+    let mut out = String::new();
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    if v < 0.0 { format!("-{out}") } else { out }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn formats_numbers() {
+        assert_eq!(group_digits(1234567.0), "1,234,567");
+        assert_eq!(group_digits(999.0), "999");
+        assert_eq!(format(3.0 * 1048576.0, Bytes), "3.0 MiB");
+        assert_eq!(format(12.34, Micros), "12.3 µs");
+    }
+
+    #[test]
+    fn describes_changes() {
+        assert_eq!(change(100.0, 102.0, Micros, Lower), "same");
+        assert_eq!(change(100.0, 150.0, Micros, Lower), "50% worse");
+        assert_eq!(change(100.0, 300.0, OpsPerSec, Higher), "3.0× better");
+        assert_eq!(change(1.0, 1.02, Ratio, Lower), "2% worse");
+        assert_eq!(change(0.0, 3.0, Count, Lower), "worse");
+        assert_eq!(change(1.0, 316.8, Micros, Lower), "317× worse");
+    }
+}

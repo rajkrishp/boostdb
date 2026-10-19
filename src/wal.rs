@@ -121,11 +121,13 @@ impl Wal {
         ))
     }
 
-    pub fn append(&mut self, record: &Record) -> Result<()> {
+    /// Appends `record`, returning the number of bytes written.
+    pub fn append(&mut self, record: &Record) -> Result<usize> {
         if self.poisoned {
             return Err(Error::WalPoisoned);
         }
-        let result = self.file.write_all(&record.encode()).and_then(|()| {
+        let buf = record.encode();
+        let result = self.file.write_all(&buf).and_then(|()| {
             if self.sync {
                 self.file.sync_data()
             } else {
@@ -137,7 +139,8 @@ impl Wal {
         if result.is_err() {
             self.poisoned = true;
         }
-        Ok(result?)
+        result?;
+        Ok(buf.len())
     }
 
     /// Refuses all further appends, for when the log may no longer be the source of truth.

@@ -13,7 +13,7 @@ mod merge;
 mod sstable;
 mod wal;
 
-pub use db::{Db, MAX_KEY_SIZE, MAX_VALUE_SIZE, Options};
+pub use db::{Db, MAX_KEY_SIZE, MAX_VALUE_SIZE, Options, Stats};
 pub use error::{Error, Result};
 
 /// A key and its value, or `None` for a tombstone.

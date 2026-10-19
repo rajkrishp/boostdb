@@ -45,6 +45,22 @@ impl Default for Options {
     }
 }
 
+/// Counts of the work a [`Db`] has done since it was opened. They measure read and write
+/// amplification in units that, unlike timings, come out the same on every machine.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Stats {
+    /// SSTables that `get` looked in, newest first, until one held the key.
+    pub sstables_checked: u64,
+    /// SSTable data blocks read from disk by `get` and `scan`.
+    pub blocks_read: u64,
+    /// Bytes appended to write-ahead logs.
+    pub wal_bytes_written: u64,
+    /// Bytes of SSTables written by memtable flushes.
+    pub sstable_bytes_written: u64,
+    /// Memtable flushes.
+    pub flushes: u64,
+}
+
 /// A key-value database stored in a directory. Safe to share across threads.
 pub struct Db {
     path: PathBuf,
@@ -61,6 +77,8 @@ struct Inner {
     memtable: MemTable,
     /// Newest first.
     sstables: Vec<SsTable>,
+    /// Every counter but `blocks_read`, which each SSTable keeps for itself.
+    stats: Stats,
 }
 
 impl Db {
@@ -142,6 +160,7 @@ impl Db {
                 wal_number,
                 memtable,
                 sstables,
+                stats: Stats::default(),
             }),
             _lock: lock,
         })
@@ -158,10 +177,11 @@ impl Db {
         }
         let mut inner = self.lock();
         self.make_room(&mut inner)?;
-        inner.wal.append(&Record::Put {
+        let written = inner.wal.append(&Record::Put {
             key: key.to_vec(),
             value: value.to_vec(),
         })?;
+        inner.stats.wal_bytes_written += written as u64;
         inner.memtable.put(key.to_vec(), value.to_vec());
         Ok(())
     }
@@ -170,17 +190,20 @@ impl Db {
         check_key(key)?;
         let mut inner = self.lock();
         self.make_room(&mut inner)?;
-        inner.wal.append(&Record::Delete { key: key.to_vec() })?;
+        let written = inner.wal.append(&Record::Delete { key: key.to_vec() })?;
+        inner.stats.wal_bytes_written += written as u64;
         inner.memtable.delete(key.to_vec());
         Ok(())
     }
 
     pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        let inner = self.lock();
-        if let Some(value) = inner.memtable.get(key) {
+        let mut guard = self.lock();
+        if let Some(value) = guard.memtable.get(key) {
             return Ok(value.map(<[u8]>::to_vec));
         }
+        let inner = &mut *guard;
         for table in &inner.sstables {
+            inner.stats.sstables_checked += 1;
             if let Some(value) = table.get(key)? {
                 return Ok(value);
             }
@@ -216,6 +239,15 @@ impl Db {
             .collect()
     }
 
+    /// Counters of the work done since the database was opened.
+    pub fn stats(&self) -> Stats {
+        let inner = self.lock();
+        Stats {
+            blocks_read: inner.sstables.iter().map(SsTable::blocks_read).sum(),
+            ..inner.stats
+        }
+    }
+
     /// Flushes the memtable if it has outgrown the threshold.
     fn make_room(&self, inner: &mut Inner) -> Result<()> {
         if inner.memtable.approximate_size() <= self.options.memtable_flush_threshold {
@@ -233,10 +265,13 @@ impl Db {
         let number = inner.wal_number;
         let table_path = self.path.join(file_name(number, Kind::Table));
         let temp_path = self.path.join(file_name(number, Kind::TempTable));
-        if let Err(e) = sstable::write(&temp_path, inner.memtable.range(None, None)) {
-            let _ = fs::remove_file(&temp_path);
-            return Err(e);
-        }
+        let written = match sstable::write(&temp_path, inner.memtable.range(None, None)) {
+            Ok(written) => written,
+            Err(e) => {
+                let _ = fs::remove_file(&temp_path);
+                return Err(e);
+            }
+        };
 
         // Once the rename may have happened, a reopen would treat the current log as
         // flushed, so writes appended to it from now on could be lost. If installing fails,
@@ -249,6 +284,8 @@ impl Db {
         inner.wal = wal;
         inner.wal_number = number + 1;
         inner.memtable = MemTable::new();
+        inner.stats.sstable_bytes_written += written;
+        inner.stats.flushes += 1;
         // If this fails, the next open deletes it instead.
         let _ = fs::remove_file(self.path.join(file_name(number, Kind::Log)));
         Ok(())

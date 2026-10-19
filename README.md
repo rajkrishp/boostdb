@@ -26,6 +26,7 @@ let db = boostdb::Db::open("./my-data")?;
 db.put(b"key", b"value")?;
 assert_eq!(db.get(b"key")?, Some(b"value".to_vec()));
 db.delete(b"key")?;
+println!("{:?}", db.stats()); // counters: SSTables checked, blocks read, bytes written, ...
 ```
 
 ## How it works today
@@ -55,6 +56,7 @@ after, means an `Err` from `put`/`delete` always means the write was not applied
 | `src/merge.rs` | K-way merge of sorted sources for scans, newest source wins |
 | `src/crc32.rs` | CRC-32 checksum for log records and SSTable blocks |
 | `src/main.rs` | Interactive shell |
+| `bench/` | Benchmark harness and `run_all.sh` (see [Benchmarks](#benchmarks)) |
 
 ## On-disk format
 
@@ -114,6 +116,59 @@ it, and `block_len`/`index_len` include the CRC. Opening a table checks the foot
 and keeps the index in memory; a point lookup binary-searches it for the first block whose
 last key is `>=` the key, reads that one block, and verifies its checksum. Range scans read
 blocks lazily, one at a time. A checksum mismatch surfaces as `Error::Corruption`.
+
+## Benchmarks
+
+`bench/` is a separate crate that produces the same scorecard for every tutorial part. Each
+part is a git tag (`part-01-wal`, `part-02-sstables`, ...), and the harness uses only the
+public API every part has, so it builds and runs unchanged against all of them.
+
+```sh
+bench/run_all.sh                         # every part-* tag, 1M keys (1-3 minutes per part)
+bench/run_all.sh -- --keys 50000 --reps 3   # a quick run; options go after --
+bench/run_all.sh part-02-sstables HEAD   # only these refs (committed code only)
+```
+
+For each ref, `run_all.sh` checks it out into a temporary git worktree, copies the current
+harness into it, builds it in release mode, and writes `bench/results/<ref>.json`. Then it
+writes `bench/results/summary.md`, a table comparing every JSON file in that directory, with
+each part's change from the previous one. To run the harness on the working tree directly:
+
+```sh
+cd bench && cargo run --release -- --keys 100000 --out /tmp/now.json
+cargo run --release -- summary results    # the comparison table, from any directory of JSON
+cargo run --release -- --help             # every option
+```
+
+### What it measures
+
+Workloads use 16-byte keys and 100-byte values chosen by a seeded PRNG, so every run does the
+same work. Each timed workload runs in a child process (so its peak memory is its own), five
+times by default, and the median is reported.
+
+| Workload | Metrics |
+|---|---|
+| Load 1M keys in random key order, `sync_writes` off | throughput, peak memory, write amplification, disk size vs. live data (space amplification), file count |
+| 500 writes with `sync_writes` on | throughput |
+| Open the loaded database | recovery time, peak memory |
+| Point reads, half hits and half misses | p50/p99 latency of each, SSTables checked and blocks read per get |
+| Range scans of about 100 keys | p50/p99 latency, blocks read per scan |
+| Overwrite: 1M writes to random existing keys | throughput, write and space amplification, then read latency and SSTables per get |
+| Delete half the keys | throughput, space amplification |
+| Crash check: SIGKILL a writer (sync on) at random moments, 20 times | acknowledged writes lost, failed reopens |
+
+Prefer the counted metrics (amplification, SSTables and blocks per get, files, lost writes):
+they come out the same on any machine. Timings depend on the machine; each JSON file records
+the CPU, memory, OS and rustc it ran with.
+
+The counters come from `Db::stats()`, which parts before it don't have: `run_all.sh` builds
+the harness without its `stats` feature for those, and their counters are `null`. The crash
+check kills the process, not the machine, so it tests recovery logic rather than whether
+fsync reaches the disk. Its values are 16 KiB so that writes cross the 4 MiB flush threshold
+and kills land during flushes too.
+
+The JSON schema is versioned (`schema_version`). Adding a metric keeps the version; renaming
+or changing one bumps it.
 
 ## Roadmap
 
