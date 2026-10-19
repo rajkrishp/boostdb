@@ -421,3 +421,40 @@ fn legacy_wal_file_is_picked_up() {
     assert_eq!(db.get(b"a").unwrap(), Some(b"1".to_vec()));
     assert_eq!(files(dir.path(), "log"), vec!["000001.log"]);
 }
+
+#[test]
+fn stats_count_reads_and_bytes_written() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open_with(dir.path(), flush_every_write()).unwrap();
+    assert_eq!(db.stats(), Default::default());
+
+    // Each log record is an 8-byte header, 9 bytes of kind and lengths, then key and value.
+    db.put(b"a", b"1").unwrap();
+    db.put(b"b", b"22").unwrap(); // flushes "a"
+    db.delete(b"c").unwrap(); // flushes "b"
+    let stats = db.stats();
+    assert_eq!(stats.wal_bytes_written, (17 + 2) + (17 + 3) + (17 + 1));
+    assert_eq!(stats.flushes, 2);
+    let sst_bytes: u64 = files(dir.path(), "sst")
+        .iter()
+        .map(|name| fs::metadata(dir.path().join(name)).unwrap().len())
+        .sum();
+    assert_eq!(stats.sstable_bytes_written, sst_bytes);
+    assert_eq!((stats.sstables_checked, stats.blocks_read), (0, 0));
+
+    // "c" is a tombstone in the memtable: no SSTable is consulted.
+    assert_eq!(db.get(b"c").unwrap(), None);
+    assert_eq!(db.stats().sstables_checked, 0);
+    // "a" is in the older SSTable. The newer one's only block ends at "b", so it could
+    // hold "a" and is read too.
+    assert_eq!(db.get(b"a").unwrap(), Some(b"1".to_vec()));
+    let stats = db.stats();
+    assert_eq!((stats.sstables_checked, stats.blocks_read), (2, 2));
+    // Nothing is past "b", so a lookup there checks both tables but reads no block.
+    assert_eq!(db.get(b"z").unwrap(), None);
+    let stats = db.stats();
+    assert_eq!((stats.sstables_checked, stats.blocks_read), (4, 2));
+    // A scan reads every block of every table.
+    assert_eq!(db.scan(None, None).unwrap().len(), 2);
+    assert_eq!(db.stats().blocks_read, 4);
+}

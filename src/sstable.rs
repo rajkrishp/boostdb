@@ -20,6 +20,7 @@
 use std::fs::File;
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::Entry;
 use crate::crc32::crc32;
@@ -34,11 +35,11 @@ const KIND_VALUE: u8 = 1;
 const KIND_TOMBSTONE: u8 = 2;
 
 /// Writes `entries`, which must be in strictly increasing key order, to a new SSTable at
-/// `path` and fsyncs it. A `None` value is a tombstone.
+/// `path` and fsyncs it, returning its size in bytes. A `None` value is a tombstone.
 pub fn write<'a>(
     path: &Path,
     entries: impl IntoIterator<Item = (&'a [u8], Option<&'a [u8]>)>,
-) -> Result<()> {
+) -> Result<u64> {
     let mut writer = Writer {
         out: BufWriter::new(File::create(path)?),
         offset: 0,
@@ -49,8 +50,9 @@ pub fn write<'a>(
     for (key, value) in entries {
         writer.add(key, value)?;
     }
-    writer.finish()?.sync_all()?;
-    Ok(())
+    let (file, len) = writer.finish()?;
+    file.sync_all()?;
+    Ok(len)
 }
 
 struct Writer {
@@ -104,7 +106,8 @@ impl Writer {
         Ok(())
     }
 
-    fn finish(mut self) -> io::Result<File> {
+    /// Writes the index and footer, returning the file and its total length.
+    fn finish(mut self) -> io::Result<(File, u64)> {
         if !self.block.is_empty() {
             self.finish_block()?;
         }
@@ -115,9 +118,12 @@ impl Writer {
         self.out
             .write_all(&(self.index.len() as u64).to_le_bytes())?;
         self.out.write_all(&MAGIC)?;
-        self.out
+        let len = self.offset + self.index.len() as u64 + FOOTER_LEN as u64;
+        let file = self
+            .out
             .into_inner()
-            .map_err(io::IntoInnerError::into_error)
+            .map_err(io::IntoInnerError::into_error)?;
+        Ok((file, len))
     }
 }
 
@@ -126,6 +132,8 @@ pub struct SsTable {
     path: PathBuf,
     file: File,
     index: Vec<BlockHandle>,
+    /// Data blocks read since the table was opened, for `Db::stats`.
+    blocks_read: AtomicU64,
 }
 
 struct BlockHandle {
@@ -164,7 +172,13 @@ impl SsTable {
             path: path.to_path_buf(),
             file,
             index,
+            blocks_read: AtomicU64::new(0),
         })
+    }
+
+    /// Data blocks read from disk since the table was opened.
+    pub fn blocks_read(&self) -> u64 {
+        self.blocks_read.load(Ordering::Relaxed)
     }
 
     /// `None` if the key is not in this table, `Some(None)` if it holds a tombstone,
@@ -202,6 +216,7 @@ impl SsTable {
     fn read_block(&self, i: usize) -> Result<Vec<Entry>> {
         let handle = &self.index[i];
         let mut buf = vec![0; handle.len as usize];
+        self.blocks_read.fetch_add(1, Ordering::Relaxed);
         read_exact_at(&self.file, &mut buf, handle.offset)?;
         verify_crc(&buf)
             .and_then(decode_block)
